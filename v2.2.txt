@@ -1,0 +1,265 @@
+; This update does not print a confirmation code; print one yourself.
+
+bits 16 ; Tells NASM to assume 16-bit registers
+; no org because it doesn't matter
+
+; mul R/M (implicitly with AX): DX=high, AX=low
+; div R/M (implicitly DX:AX/(R/M)): DX=remainder, AX=quotient
+
+cli
+cld
+push word 0
+pop ss
+push cs
+pop ds
+mov ax, 7C00h ; stack area goes below bootsector
+mov sp, ax
+mov bp, ax
+xor ax, ax
+push word 0B800h ; for PrintNum
+pop fs
+push word 07E0h ; to search for the filename and cluster number later
+pop es
+mov dh, dl ; duplicating disk number for debugging
+
+;DAP-Search= LEA of [bp-16] (segment 07BFh)
+push ax ; high word of DAP  - never changed
+push ax ; high LBA  - never changed
+push ax ; mid LBA  - never changed
+push ax ; low LBA (-8)
+push es ; segment of the mem buffer (07E0) - never changed
+push ax ; offset of the mem buffer - never changed
+push word 1 ; number of sectors to load - never changed
+push word 16 ; size of DAP in bytes - never changed
+
+;DAP-Loader= LEA of [bp-32] (segment 07BEh)
+push ax ; high word of DAP - never changed
+push ax ; high LBA  - never changed
+push ax ; mid LBA (-22)
+push ax ; low LBA (-24)
+push word 1000h ; segment of the mem buffer  - never changed
+push ax ; offset of the mem buffer (-28)
+push ax ; number of sectors to load
+push word 16 ; size of the DAP in bytes
+
+push ax ; segment alignment for debugging
+
+push dx ; DiskNumber=[bp-36]
+
+mov bx, [bp+14] ; BPB_RsvdSecCnt
+movzx dx, byte[bp+16] ; BPB_NumFATs
+mov ax, [bp+22] ; BPB_FATSz16
+mul dx
+add bx, ax
+push bx ; StartRoot=[bp-38]
+mov ax, [bp+17] ; BPB_RootEntCnt
+shl ax, 5
+xor dx, dx
+mov cx, [bp+11] ; BPB_BytsPerSec
+div cx
+push ax ; NumRootSectors=[bp-40]
+add bx, ax
+push bx ; StartData=[bp-42]
+movzx ax, byte[bp+13] ; BPB_SecPerClus
+mov [bp-30], ax ; Load into number of sectors in DAP-Loader
+mul cx
+push ax ; BytesPerCluster=[bp-44]
+shr cx, 5
+push cx ; EntriesPerSector=[bp-46]
+
+call Filename ; Filename=[bp-48]
+db 'BOOTIA32BIN' ; to search for the exact filename "BOOTIA32.BIN"
+Filename:
+
+;RootSearch
+  xor cx, cx
+LoadRootSector:
+  push cx ; Save RootSectorsChecked
+  add cx, [bp-38] ; add StartRoot value
+  mov [bp-8], cx ; load low LBA of DAP-Search
+  push word 07BFh
+  call ReadDisk
+  xor cx, cx
+CheckEntries:
+  push cx ; save EntriesChecked
+  shl cx, 5
+  mov bx, cx ; save offset for later if file found
+CheckEntryForFilename:
+  mov si, [bp-48] ; Filename address
+  mov di, cx
+  mov cx, 11
+  repz cmpsb ; Compare strings in [ds:si] and [es:di]. Repeat while equal.
+  jcxz FileFound ; If CX is zero, the end of the strings were reached.
+  pop cx ; load EntriesChecked
+  inc cx
+  cmp cx, [bp-46] ; check EntriesPerSector
+  jne short CheckEntries
+  pop cx ; load RootSectorsChecked
+  inc cx
+  cmp cx, [bp-40] ; check NumRootSectors
+  je short FileMissing
+  jmp short LoadRootSector
+FileMissing:
+  push word 0EC0Fh ; Error Code - No File
+  call PrintNum
+
+FileFound:
+  pop ax
+  pop ax
+  ; bx= Entry Offset into sector
+  mov al, [es:bx+11]
+  test al, 18h ; 10h=Directory, 08h=VolumeID
+  jz short FileValid
+    push word 0ECFDh ; Error Code - File is a Directory
+    call PrintNum
+FileValid:
+  push word [es:bx+26] ; Starting Cluster Number = [bp-50]
+  push word [es:bx+28] ; low word of file size
+  mov ax, [es:bx+30] ; high word of file size
+  test ax, ax
+  jz short ProcessSize
+    mov word[bp-52], 0FFFFh ; if high word nonzero, set size to 64KB
+ProcessSize:
+  pop ax
+  test ax, ax
+  jnz short SizeNonzero
+    push word 0ECF0h ; Error Code - Filesize is Zero
+    call PrintNum
+SizeNonzero:
+  xor dx, dx
+  div word [bp-44] ; BytesPerCluster
+  inc ax ; Unlikely that dx will be zero here, so round up
+  mov cx, ax ; cx = NumClusters
+  pop bx ; bx = Cluster Number
+
+LoadFileClusters:
+  mov dx, bx
+  dec dx
+  dec dx
+  movzx ax, byte[bp+13] ; SecPerClus
+  mul dx
+  add ax, [bp-42] ; StartData
+  adc dx, 0
+  mov [bp-24], ax ; low LBA of DAP-Loader
+  mov [bp-22], dx ; mid LBA of DAP-Loader
+  push word 07BEh
+  call ReadDisk
+  mov ax, [bp-44] ; load BytesPerCluster
+  add [bp-28], ax ; update DAP-Loader offset
+  xor dx, dx
+  mov ax, bx
+  shl ax, 1
+  div word[bp+11] ; BytsPerSec
+  add ax, [bp+14] ; RsvdSecCnt
+  mov bx, dx
+  mov [bp-8], ax ; low LBA of DAP-Search
+  push word 07BFh
+  call ReadDisk
+  mov bx, [es:bx] ; cluster number updated
+  dec cx
+  jnz short LoadFileClusters
+
+sti ; enable interrupts for the loaded program
+jmp 1000h:0  ; location of loaded file
+
+;PrintWords: ; needed this for debugging
+; LArrow -1 sector, RArrow +1 sector, UArrow +1 offset, DArrow -1 offset
+;  pop gs
+;  pop di
+;  push gs
+;  push ds
+;  pusha
+;  mov dx, di
+;  mov dx, di
+;  xor bx, bx
+;.Print:
+;  mov word[bp], 0
+;  mov ds, dx
+;  mov si, bx
+;  push ds
+;  call PrintNum
+;  push si
+;  call PrintNum
+;  lodsw
+;  push ax
+;  call PrintNum
+;.GetKey:
+;  xor ax, ax
+;  int 16h
+;  cmp ah, 01h
+;  je short .Escape
+;  inc bx
+;  cmp ah, 48h
+;  je short .Print
+;  dec bx
+;  dec bx
+;  cmp ah, 50h
+;  je short .Print
+;  inc bx
+;  inc dx
+;  cmp ah, 4Dh
+;  je short .Print
+;  dec dx
+;  dec dx
+;  cmp ah, 4Bh
+;  je short .Print
+;  inc dx
+;  jmp short .GetKey
+;.Escape:
+;  pop ds
+;  popa
+;  ret
+
+ReadDisk: ; (v2)
+  pop gs ; save IP
+  pop di ; get argument
+  push gs ; restore IP
+  push ds
+  pusha
+  mov ds, di
+  sti
+  xor si, si
+  mov ah, 42h  ; Extended Read Disk function index
+  mov dx, [bp-36] ; load BIOS Disk Number
+  int 13h
+  jnc short .NoProblems
+    ;push word 0ECDEh ; Error Code - Disk Error
+    mov al, ah ; move Disk Error Code to low byte
+    mov ah, 0DEh ; high byte is DE to indicate a Disk Error
+    push ax
+    call PrintNum
+.NoProblems:
+  cli
+  popa
+  pop ds
+  ret
+
+PrintNum:
+  ; Assume video mem segment is in FS, CursorPos is in [bp]
+  pop di ; get IP out of the way
+  pop ax ; get the argument
+  push fs
+  pop es
+  mov bx, 16
+  mov cx, 4
+.ConvertNext:
+  xor dx, dx
+  div bx
+  add dx, 48
+  cmp dx, 58
+  jb short .lt10
+  add dx, 7
+.lt10:
+  mov dh, 0Fh
+  push dx
+  dec cx
+  jnz short .ConvertNext
+  mov cx, 4
+  mov di, 0
+.PrintNext:
+  pop ax
+  stosw
+  dec cx
+  jnz short .PrintNext
+  sti ; enable interrupts for rebooting
+  dw 0FEEBh ; halt
